@@ -38,7 +38,7 @@ CREATE TABLE Attendance (
     out_time TIMESTAMP,
     total_hours NUMBER
 );
-
+DROP TABLE Attendance;
 
 -- Payroll Table
 CREATE TABLE Payroll (
@@ -228,13 +228,24 @@ SHOW ERRORS TRIGGER MonthlyAttendanceSummary_before_insert;
 
 
 -- 1- Attendence Validation Trigger
+Create or replace PROCEDURE LogSuspendedAttempt(p_employee_id NUMBER) 
+IS PRAGMA AUTONOMOUS_TRANSACTION;
+BEGIN
+        INSERT INTO SuspendedAttendanceAttempts (employee_id, attemptdate)
+        VALUES (p_employee_id, SYSDATE);
+        COMMIT; -- Commit the autonomous transaction
+END LogSuspendedAttempt;
+        
+SHOW ERRORS PROCEDURE LogSuspendedAttempt;
+
 CREATE OR REPLACE TRIGGER ValidateAttendance
 BEFORE INSERT ON Attendance
 FOR EACH ROW
 DECLARE
     employee_status VARCHAR2(20);
     insert_excp EXCEPTION;
-     PRAGMA EXCEPTION_INIT(insert_excp, -20004);
+    PRAGMA EXCEPTION_INIT(insert_excp, -20004);
+    
 BEGIN
     DBMS_OUTPUT.PUT_LINE('Checking employee ID: ' || :NEW.employee_id);
 
@@ -243,6 +254,7 @@ BEGIN
         SELECT status INTO employee_status
         FROM Employees
         WHERE id = :NEW.employee_id;
+        
     EXCEPTION
         WHEN NO_DATA_FOUND THEN
             DBMS_OUTPUT.PUT_LINE('Employee not found for ID: ' || :NEW.employee_id);
@@ -251,26 +263,23 @@ BEGIN
             DBMS_OUTPUT.PUT_LINE('Multiple employees found for ID: ' || :NEW.employee_id);
             RAISE_APPLICATION_ERROR(-20003, 'Multiple employees found for the same ID.');
     END;
-    BEGIN
-        -- Check if the employee is suspended
-        IF employee_status = 'suspended' THEN
-            DBMS_OUTPUT.PUT_LINE('Employee ' || :NEW.employee_id || ' is suspended.');
+
+    -- Check if the employee is suspended
     
-            -- Log the attempt to SuspendedAttendanceAttempts table
-            INSERT INTO SuspendedAttendanceAttempts (employee_id, attemptdate)
-            VALUES (:NEW.employee_id, SYSDATE);
+    IF employee_status = 'suspended' THEN
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE('Employee ' || :NEW.employee_id || ' is suspended.');
         
-            -- Prevent the insert into Attendance table
-            --RAISE insert_excp;
-            --RAISE_APPLICATION_ERROR(-20004, 'Can not complete insertion employee is suspended.');
-            
-        ELSE
-            DBMS_OUTPUT.PUT_LINE('Employee ' || :NEW.employee_id || ' is active. Inserting into Attendance.');
-        END IF;
-    EXCEPTION
-        WHEN insert_excp THEN
-        DBMS_OUTPUT.PUT_LINE('Invalid Insertion: Employee is suspended.');
+        -- Log the attempt to SuspendedAttendanceAttempts table
+        LogSuspendedAttempt(:NEW.employee_id);
+        DBMS_OUTPUT.PUT_LINE('Inserting into suspended table');
+        
     END;
+        -- Prevent the insert into Attendance table by raising an error
+        RAISE_APPLICATION_ERROR(-20004, 'Cannot complete insertion: Employee is suspended.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('Employee ' || :NEW.employee_id || ' is active. Inserting into Attendance.');
+    END IF;
 END;
 
 SHOW ERRORS TRIGGER ValidateAttendance;
@@ -538,152 +547,70 @@ END;
 SELECT * FROM AdjustmentAudit;
 
 
--- Deadlock Handling (Update Salary Procedure)
-CREATE OR REPLACE PROCEDURE update_salary(n_department VARCHAR) IS
-    deadlock_exception EXCEPTION;
-    PRAGMA EXCEPTION_INIT(deadlock_exception, -60); -- Map ORA-00060 to an exception
-    retry_count INTEGER := 3; -- Number of retry attempts
-    attempt INTEGER := 0;
+-- 10. Blocker-Waiting Situation
+-- This section demonstrates a blocker-waiting scenario with two transactions.
+-- Two users (User 1 and User 2) attempt to update employees' salaries in the same department.
+-- EXPECTED RESULT:
+-- User 2 is blocked until User 1 commits or rolls back.
+
+-- FUNCTION: Update salary by 10%
+CREATE OR REPLACE FUNCTION update_salary(n_department VARCHAR) RETURN VARCHAR IS
 BEGIN
-    LOOP
-        BEGIN
-            attempt := attempt + 1;
-            -- Lock the first department
-            UPDATE Employees
-            SET salary = salary + salary * 0.1
-            WHERE department = n_department;
+    UPDATE Employees
+    SET salary = salary + salary * 0.1
+    WHERE department = n_department;
 
-            DBMS_SESSION.SLEEP(5); -- Simulate delay to allow the second session to create a conflict
-
---            -- Lock the second department
---            UPDATE Employees
---            SET salary = salary + salary * 0.1
---            WHERE department = n_department;
-
-            DBMS_OUTPUT.PUT_LINE('Updated successfully in attempt: ' || attempt);
-
-            -- Exit loop if successful
-            EXIT;
-        EXCEPTION
-            WHEN deadlock_exception THEN
-                DBMS_OUTPUT.PUT_LINE('Deadlock detected. Retrying... Attempt: ' || attempt);
-                IF attempt >= retry_count THEN
-                    DBMS_OUTPUT.PUT_LINE('Max retry attempts reached. Exiting...');
-                    ROLLBACK;
-                    EXIT;
-                ELSE
-                    ROLLBACK; -- Rollback and retry
-                END IF;
-        END;
-    END LOOP;
-
-    --COMMIT; -- Commit only after successful execution
+    RETURN 'Salary updated for department: ' || n_department;
 END update_salary;
 
+SHOW ERRORS FUNCTION update_salary;
 
-SHOW ERRORS PROCEDURE update_salary;
-
--- Test Procedure Update Salary User1
+-- TEST CASE: Blocker-Waiting Situation
+-- Transaction 1 (User 1):
+-- Start Transaction
+DECLARE
+    message VARCHAR(100);
 BEGIN
-    update_salary('HR');
+    message:= update_salary('HR');
+    DBMS_OUTPUT.PUT_LINE(message);
+    -- Wait without commit to simulate blocking
+    DBMS_SESSION.SLEEP(5);
 END;
-COMMIT;
+
+-- 11. Identifying Blocker and Waiting Sessions
+SELECT
+    V$SESSION.sid,
+    v$session.serial#,
+    v$lock.request,
+    V$lock.block
+FROM
+    v$session
+    JOIN v$LOCK ON V$SESSION.SID = V$LOCK.sid
+WHERE
+    v$lock.request != 0 or v$lock.block != 0;
 
 
 
+-- 12. Deadlock Demonstration
+-- This section demonstrates a deadlock scenario with two transactions.
+-- Two users (User 1 and User 2) attempt to lock resources in reverse order.
+-- EXPECTED RESULT:
+-- A deadlock occurs as each session is waiting for the other to release the lock.
+-- Oracle raises ORA-00060: deadlock detected.
 
-
-
-
-
-
---
--- Deadlock Handling
---DECLARE
---    deadlock_exception EXCEPTION;
---    PRAGMA EXCEPTION_INIT(deadlock_exception, -54);
---BEGIN
---    -- Step 1: Lock TableA
---        UPDATE employees
---        SET salary = salary + salary * 0.1
---        WHERE department = 'HR';
---    
---EXCEPTION
---    WHEN deadlock_exception THEN
---        -- Handle deadlock by rolling back
---        DBMS_OUTPUT.PUT_LINE ( 'Table is busy' );
---        ROLLBACK;
---        DBMS_OUTPUT.PUT_LINE('Deadlock detected and transaction rolled back in User1.');
---END;
---
---    
---
---CREATE OR REPLACE PROCEDURE update_salary(n_department varchar) IS
---    deadlock_exception EXCEPTION;
---    PRAGMA EXCEPTION_INIT(deadlock_exception, -54);
---BEGIN
---        UPDATE employees
---        SET salary = salary + salary * 0.1
---        WHERE department = n_department;
---        DBMS_OUTPUT.PUT_LINE('updated successfully');
---
---EXCEPTION
---    WHEN deadlock_exception THEN
---        -- Handle deadlock by rolling back
---        DBMS_OUTPUT.PUT_LINE ( 'Table is busy' );
---        ROLLBACK;
---    END update_salary;
---    
---
---CREATE OR REPLACE PROCEDURE update_salary(n_department varchar) IS
---    deadlock_exception EXCEPTION;
---    PRAGMA EXCEPTION_INIT(deadlock_exception, -54);
---BEGIN
---        SELECT id FROM EMPLOYEES WHERE ROWNUM = 1 FOR UPDATE NOWAIT;
---
---        UPDATE employees
---        SET salary = salary + salary * 0.1
---        WHERE department = n_department;
---        DBMS_OUTPUT.PUT_LINE('updated successfully');
---
---EXCEPTION
---    WHEN deadlock_exception THEN
---        -- Handle deadlock by rolling back
---        DBMS_OUTPUT.PUT_LINE ( 'Table is busy' );
---        ROLLBACK;
---    END update_salary;
---    
---    
---    
---    
-    
---execute update_salary('management');
---SELECT id FROM EMPLOYEES WHERE ROWNUM = 1 FOR UPDATE NOWAIT;
---rollback;
---commit;
-
-
-
--- Deadlock Handling (Update Salary Procedure)
-CREATE OR REPLACE PROCEDURE update_salary(n_department VARCHAR) IS
-    deadlock_exception EXCEPTION; -- Declare deadlock exception
-    PRAGMA EXCEPTION_INIT(deadlock_exception, -60); -- Associate ORA-00060 with the exception
+-- TEST CASE: Deadlock Scenario
+-- Transaction 1 (User 1):
+-- Start Transaction
+-- Kill the Block Session
+DECLARE
+    message VARCHAR(100);
 BEGIN
-    BEGIN
-        UPDATE Employees
-        SET salary = salary + salary * 0.1
-        WHERE department = n_department;
-        DBMS_SESSION.sleep(5);
-        UPDATE Employees
-        SET salary = salary + salary * 0.1
-        WHERE department = n_department;
-        
-        DBMS_OUTPUT.PUT_LINE('Updated successfully');
-    EXCEPTION
-        WHEN deadlock_exception THEN
-            DBMS_OUTPUT.PUT_LINE('Deadlock detected. Retrying...');
-            -- You can implement retry logic here if desired
-    END;
-END update_salary;
+    message := "deadlock_manager".update_salary_deadlock_handling('Finance');
+    DBMS_OUTPUT.PUT_LINE(message);
+    DBMS_SESSION.SLEEP(10); -- Simulate holding lock
+    message := "deadlock_manager".update_salary_deadlock_handling('HR');
+    DBMS_OUTPUT.PUT_LINE(message);
+END;
 
 
+COMMIT;

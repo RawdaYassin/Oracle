@@ -37,7 +37,7 @@ WHERE employee_id = 3;
 
 DELETE 
 FROM  "User1".Attendance 
-WHERE employee_id = 3 or employee_id = 1;
+WHERE employee_id = 3 or employee_id = 1 OR employee_id is null;
 
 
 -- Test the Work Hours Calculation Function
@@ -100,12 +100,36 @@ END;
 SELECT * FROM  "User1".Deductions;
 
 
--- Test Procedure Update Salary User2
+-- TEST CASE: Blocker-Waiting Situation
+-- Start Transaction
+-- Transaction 2 (User 2):
+-- Attempt to update the same department, which will be blocked by User 1
+DECLARE
+    message VARCHAR(100);
 BEGIN
-    "User1".update_salary('HR');
+    message:= "User1".update_salary('HR');
+    DBMS_OUTPUT.PUT_LINE(message);
+    -- Wait without commit to simulate blocking
+    DBMS_SESSION.SLEEP(10);
 END;
-COMMIT;
 
+
+-- TEST CASE: Deadlock Scenario
+-- Transaction 2 (User 2):
+-- Start Transaction
+-- Kill the Waiting Session
+DECLARE
+    message VARCHAR(100);
+BEGIN
+    message := "deadlock_manager".update_salary_deadlock_handling('HR');
+    DBMS_OUTPUT.PUT_LINE(message);
+    DBMS_SESSION.SLEEP(10); -- Simulate holding lock
+    message := "deadlock_manager".update_salary_deadlock_handling('Finance');
+    DBMS_OUTPUT.PUT_LINE(message);
+END;
+
+
+COMMIT;
 
 --INSERT INTO Attendance (id, employee_id, "date", in_time, out_time, total_hours)
 --VALUES 
@@ -123,7 +147,7 @@ VALUES
 (2, 2, 'December', 170, 300, 1500, 26200),
 (3, 4, 'December', 150, 200, 1200, 21000);
 
-*/
+
 INSERT INTO "User1".LeaveRequests (id, employee_id, leave_date, reason, approval_status)
 VALUES 
 (1, 1, TO_DATE('2024-12-05', 'YYYY-MM-DD'), 'Medical Leave', 'approved'),
@@ -167,17 +191,4 @@ VALUES
 (4, TO_DATE('2024-11-01', 'YYYY-MM-DD'), 20, 2, 7.5);
 
 
-*/
-
-
-
-
-
-
-
-/*
-exec "user1".update_salary('management');
-commit;
-select * from "user1".employees FOR UPDATE NOWAIT;
-ROLLBACK;
 */
